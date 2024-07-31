@@ -9,9 +9,9 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import pl.milosz000.github.user.repo.viewer.dto.GitHubUserRepositoriesInfoResponseDTO;
 import pl.milosz000.github.user.repo.viewer.service.GitHubRepositoriesService;
+import reactor.core.publisher.Flux;
 
 import java.io.IOException;
-import java.util.List;
 
 @RestController
 @RequestMapping("/repositories")
@@ -21,7 +21,7 @@ public class GitHubRepositoriesController {
     private final GitHubRepositoriesService gitHubRepositoriesService;
 
     @GetMapping(value = "/{username}", produces = "application/json")
-    public ResponseEntity<List<GitHubUserRepositoriesInfoResponseDTO>> getRepositories(@PathVariable("username") String username) throws IOException {
+    public ResponseEntity<Flux<GitHubUserRepositoriesInfoResponseDTO>> getRepositories(@PathVariable("username") String username) throws IOException {
         return new ResponseEntity<>(gitHubRepositoriesService.getDetailsForUser(username), HttpStatusCode.valueOf(200));
     }
 }
