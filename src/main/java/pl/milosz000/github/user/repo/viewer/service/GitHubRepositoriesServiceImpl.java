@@ -9,11 +9,14 @@ import org.springframework.stereotype.Service;
 import pl.milosz000.github.user.repo.viewer.dto.GitHubBranchResponseDTO;
 import pl.milosz000.github.user.repo.viewer.dto.GitHubRepoResponseDTO;
 import pl.milosz000.github.user.repo.viewer.dto.GitHubUserRepositoriesInfoResponseDTO;
+import pl.milosz000.github.user.repo.viewer.exceptions.GitHubApiException;
 import pl.milosz000.github.user.repo.viewer.exceptions.GitHubNotFoundException;
+import pl.milosz000.github.user.repo.viewer.exceptions.GitHubUnauthorizeException;
 import pl.milosz000.github.user.repo.viewer.exceptions.GitHubUserNotFoundException;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 import java.io.IOException;
-import java.util.LinkedList;
 import java.util.List;
 
 @Slf4j
@@ -24,43 +27,61 @@ public class GitHubRepositoriesServiceImpl implements GitHubRepositoriesService 
     private final GitHubApiService githubApiService;
 
     @Override
-    public List<GitHubUserRepositoriesInfoResponseDTO> getDetailsForUser(String username) throws IOException {
-        List<GitHubRepoResponseDTO> userNonForkedRepositories = getUserRepositories(username);
-        return getRepositoryBranchesInfo(userNonForkedRepositories);
+    public Flux<GitHubUserRepositoriesInfoResponseDTO> getDetailsForUser(String username) throws IOException {
+        return getUserRepositories(username)
+                .flatMapMany(this::getRepositoryBranchesInfo);
     }
 
-    private List<GitHubRepoResponseDTO> getUserRepositories(String username) throws IOException {
-        String apiUrl = String.format("https://api.github.com/users/%s/repos", username);
+    private Mono<List<GitHubRepoResponseDTO>> getUserRepositories(String username) throws IOException {
 
-        try {
-            String jsonResponse = githubApiService.makeApiCall(apiUrl);
+        return githubApiService.getRepositories(username)
+                .flatMap(jsonResponse -> {
+                    TypeReference<List<GitHubRepoResponseDTO>> typeRef = new TypeReference<>() {};
+                    try {
+                        List<GitHubRepoResponseDTO> repositories = parseGitHubResponse(jsonResponse, typeRef);
+                        // Filter out forked repositories and return an immutable list
+                        return Mono.just(repositories.stream()
+                                .filter(repo -> !repo.isFork())
+                                .toList());
+                    } catch (JsonProcessingException e) {
+                        return Mono.error(new GitHubApiException("An error occurred while processing json response"));
+                    }
+                })
+                .onErrorMap(e -> switch (e) {
+                    case GitHubNotFoundException gitHubNotFoundException ->
+                            new GitHubUserNotFoundException(String.format("Cannot find user with username: %s", username));
+                    case GitHubUnauthorizeException gitHubUnauthorizeException ->
+                            new GitHubUnauthorizeException(e.getMessage());
+                    case GitHubApiException gitHubApiException -> new GitHubApiException(e.getMessage());
+                    default -> e;
+                });
 
-            TypeReference<List<GitHubRepoResponseDTO>> typeRef = new TypeReference<>() {};
-            List<GitHubRepoResponseDTO> repositories = parseGitHubResponse(jsonResponse, typeRef);
-
-            return repositories.stream()
-                    .filter(repo -> !repo.isFork())
-                    .toList();
-
-        } catch (GitHubNotFoundException e) {
-            throw new GitHubUserNotFoundException(String.format("Cannot found user with username: %s", username));
-        }
     }
 
-    private List<GitHubUserRepositoriesInfoResponseDTO> getRepositoryBranchesInfo(List<GitHubRepoResponseDTO> userRepositories) throws IOException {
-        List<GitHubUserRepositoriesInfoResponseDTO> userRepositoriesInfo = new LinkedList<>();
+    private Flux<GitHubUserRepositoriesInfoResponseDTO> getRepositoryBranchesInfo(List<GitHubRepoResponseDTO> userRepositories) {
+        return Flux.fromIterable(userRepositories) // Create a Flux from the userRepositories list
+                .flatMap(repo -> {
+                    String owner = repo.getOwner().getLogin();
+                    String repoName = repo.getName();
 
-        for (GitHubRepoResponseDTO repository : userRepositories) {
-            String apiUrl = String.format("https://api.github.com/repos/%s/%s/branches", repository.getOwner().getLogin(), repository.getName());
-            String jsonResponse = githubApiService.makeApiCall(apiUrl);
+                    // Call the getBranches method to get branches reactively
+                    return githubApiService.getBranches(owner, repoName)
+                            .flatMap(response -> {
+                                // Deserialize the response into a list of GitHubBranchResponseDTO
+                                TypeReference<List<GitHubBranchResponseDTO>> typeRef = new TypeReference<>() {};
+                                List<GitHubBranchResponseDTO> branches;
+                                try {
+                                    branches = parseGitHubResponse(response, typeRef);
+                                } catch (JsonProcessingException e) {
+                                    return Mono.error(new RuntimeException("Error parsing branch response", e)); // Handle parsing error
+                                }
 
-            TypeReference<List<GitHubBranchResponseDTO>> typeRef = new TypeReference<>() {};
-            List<GitHubBranchResponseDTO> branches = parseGitHubResponse(jsonResponse, typeRef);
-            userRepositoriesInfo.add(setUserRepositoriesInfo(repository, branches));
-        }
-
-        return userRepositoriesInfo;
+                                // Return the info for this repository wrapped in a Mono
+                                return Mono.just(setUserRepositoriesInfo(repo, branches));
+                            });
+                });
     }
+
 
     private <T> List<T> parseGitHubResponse(String jsonResponse, TypeReference<List<T>> typeReference) throws JsonProcessingException {
         ObjectMapper objectMapper = new ObjectMapper();
@@ -69,23 +90,22 @@ public class GitHubRepositoriesServiceImpl implements GitHubRepositoriesService 
 
     private GitHubUserRepositoriesInfoResponseDTO setUserRepositoriesInfo(GitHubRepoResponseDTO repository, List<GitHubBranchResponseDTO> branches) {
         GitHubUserRepositoriesInfoResponseDTO response = new GitHubUserRepositoriesInfoResponseDTO();
-        List<GitHubUserRepositoriesInfoResponseDTO.GitHubBranchDetailsDTO> branchesDetails = new LinkedList<>();
 
         response.setRepositoryName(repository.getName());
         response.setOwnerLogin(repository.getOwner().getLogin());
 
-        branches.forEach(branch -> {
-            GitHubUserRepositoriesInfoResponseDTO.GitHubBranchDetailsDTO branchDetails = new GitHubUserRepositoriesInfoResponseDTO.GitHubBranchDetailsDTO();
-            branchDetails.setBranchName(branch.getName());
-            branchDetails.setLastCommitSHA(branch.getCommit().getSha());
-
-            branchesDetails.add(branchDetails);
-        });
+        // Use streams to create an immutable list of branch details
+        List<GitHubUserRepositoriesInfoResponseDTO.GitHubBranchDetailsDTO> branchesDetails = branches.stream()
+                .map(branch -> {
+                    GitHubUserRepositoriesInfoResponseDTO.GitHubBranchDetailsDTO branchDetails = new GitHubUserRepositoriesInfoResponseDTO.GitHubBranchDetailsDTO();
+                    branchDetails.setBranchName(branch.getName());
+                    branchDetails.setLastCommitSHA(branch.getCommit().getSha());
+                    return branchDetails;
+                })
+                .toList();
 
         response.setBranches(branchesDetails);
-
-        response.setBranches(branchesDetails);
-
         return response;
     }
+
 }
